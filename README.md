@@ -1,2 +1,2 @@
 # bunyan-sift
-Extension to the `node-bunyan` log viewer/formatter to exclude properties from displayed records
+Extension to the https://github.com/trentm/node-bunyan log viewer/formatter to exclude properties from displayed records
