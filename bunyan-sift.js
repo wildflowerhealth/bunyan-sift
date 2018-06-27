@@ -232,11 +232,10 @@ function printHelp() {
 
     // bunyan-sift
     p('  -s, --sift PATH');
-    p('                Sift each log message removing any elements');
-    p('                that match PATH. E.g.:');
+    p('                Sift each log message removing any');
+    p('                elements that match PATH. E.g.:');
     p('                    -s req.headers');
-    p('                    -s pid');
-    p('                will hide the process id and request headers');
+    p('                will hide the request headers');
     p('                for all messages displayed.');
 
     p('  --strict      Suppress all but legal Bunyan JSON log lines. By default');
@@ -333,8 +332,8 @@ function siftRecord(rec, opts)
     if (opts.siftPaths == null || opts.siftPaths.length < 1) {
         return;
     }
-    var obj = rec;
     opts.siftPaths.forEach(function (elements) {
+        var obj = rec;
         for (var i = 0; i < elements.length - 1; i++) {
             var element = elements[i];
             if (obj[element] != null) {
