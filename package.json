@@ -1,9 +1,9 @@
 {
   "name": "bunyan-sift",
-  "version": "1.8.2",
+  "version": "1.8.12",
   "description": "Extension to the https://github.com/trentm/node-bunyan log viewer/formatter to exclude properties from displayed records",
   "bin": {
-    "bunyan-sift": "bunyan-sift"
+    "bunyan-sift": "bunyan-sift.js"
   },
   "repository": {
     "type": "git",
