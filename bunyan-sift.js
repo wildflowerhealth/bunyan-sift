@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-
 /**
  * Copyright 2018 Blake Mitchell
  * Copyright 2018 Wildflower Health
@@ -19,6 +18,8 @@
  * vim: expandtab:ts=4:sw=4
  */
 
+var VERSION = '1.8.12';
+
 var p = console.log;
 var util = require('util');
 var pathlib = require('path');
@@ -31,8 +32,6 @@ var child_process = require('child_process'),
     exec = child_process.exec,
     execFile = child_process.execFile;
 var assert = require('assert');
-
-var exeunt = require('exeunt');
 
 try {
     var moment = require('moment');
@@ -47,13 +46,7 @@ var nodeVer = process.versions.node.split('.').map(Number);
 var nodeSpawnSupportsStdio = (nodeVer[0] > 0 || nodeVer[1] >= 8);
 
 // Internal debug logging via `console.warn`.
-var _selfTrace = function selfTraceNoop() {};
-if (process.env.BUNYAN_SELF_TRACE === '1') {
-    _selfTrace = function selfTrace() {
-        process.stderr.write('[bunyan self-trace] ');
-        console.warn.apply(null, arguments);
-    }
-}
+var _DEBUG = false;
 
 // Output modes.
 var OM_LONG = 1;
@@ -116,10 +109,6 @@ var TIMEZONE_LOCAL_FORMATS = {
 };
 
 
-// Boolean set to true when we are in the process of exiting. We don't always
-// hard-exit (e.g. when staying alive while the pager completes).
-var exiting = false;
-
 // The current raw input line being processed. Used for `uncaughtException`.
 var currLine = null;
 
@@ -140,12 +129,8 @@ var stdout = process.stdout;
 
 //---- support functions
 
-var _version = null;
 function getVersion() {
-    if (_version === null) {
-        _version = require('../package.json').version;
-    }
-    return _version;
+    return VERSION;
 }
 
 
@@ -350,7 +335,7 @@ function siftRecord(rec, opts)
     }
     var obj = rec;
     opts.siftPaths.forEach(function (elements) {
-        for (var i = 0; i < elements.length - 2; i++) {
+        for (var i = 0; i < elements.length - 1; i++) {
             var element = elements[i];
             if (obj[element] != null) {
                 obj = obj[element];
@@ -776,11 +761,6 @@ var minValidRecord = {
  * records) or enqueues it for emitting later when it's the next line to show.
  */
 function handleLogLine(file, line, opts, stylize) {
-    if (exiting) {
-        _selfTrace('warn: handleLogLine called while exiting');
-        return;
-    }
-
     currLine = line; // intentionally global
 
     // Emit non-JSON lines immediately.
@@ -972,6 +952,11 @@ function emitRecord(rec, line, opts, stylize) {
             })
         }
 
+        /*
+         * `client_req` is the typical field name for an *HTTP client request
+         * object* serialized by the restify-clients library. Render the
+         * client request somewhat like `curl` debug output shows it.
+         */
         if (rec.client_req && typeof (rec.client_req) === 'object') {
             var client_req = rec.client_req;
             delete rec.client_req;
@@ -979,10 +964,48 @@ function emitRecord(rec, line, opts, stylize) {
             var headers = client_req.headers;
             delete client_req.headers;
 
-            var s = format('%s %s HTTP/%s%s',
-                client_req.method,
+            /*
+             * `client_req.address`, and `client_req.port`, provide values for
+             * a *likely* "Host" header that wasn't included in the serialized
+             * headers. Node.js will often add this "Host" header in its
+             * `http.ClientRequest`, e.g. for node v6.10.3:
+             *      // JSSTYLED
+             *      https://github.com/nodejs/node/blob/v6.10.3/lib/_http_client.js#L88-L105
+             *
+             * If `client_req.port` exists and is 80 or 443, we *assume* that
+             * is the default protocol port, and elide it per the `defaultPort`
+             * handling in the node.js link above.
+             *
+             * Note: This added Host header is a *guess*. Bunyan shouldn't be
+             * doing this "favour" for users because it can be wrong and
+             * misleading. Bunyan 2.x will drop adding this. See issue #504
+             * for details.
+             */
+            var hostHeaderLine = '';
+            if (!headers || !(
+                    Object.hasOwnProperty.call(headers, 'host') ||
+                    Object.hasOwnProperty.call(headers, 'Host') ||
+                    Object.hasOwnProperty.call(headers, 'HOST')
+                )
+            ) {
+                if (Object.hasOwnProperty.call(client_req, 'address')) {
+                    hostHeaderLine = '\nHost: ' + client_req.address;
+                    if (Object.hasOwnProperty.call(client_req, 'port')) {
+                        // XXX
+                        var port = +client_req.port;
+                        if (port !== 80 && port !== 443) {
+                            hostHeaderLine += ':' + client_req.port;
+                        }
+                        delete client_req.port;
+                    }
+                    delete client_req.address;
+                }
+            }
+
+            var s = format('%s %s HTTP/%s%s%s', client_req.method,
                 client_req.url,
                 client_req.httpVersion || '1.1',
+                hostHeaderLine,
                 (headers ?
                     '\n' + Object.keys(headers).map(
                         function (h) {
@@ -1004,7 +1027,7 @@ function emitRecord(rec, line, opts, stylize) {
             // to stomp on a literal 'client_req.foo' key.
             Object.keys(client_req).forEach(function (k) {
                 rec['client_req.' + k] = client_req[k];
-            });
+            })
             details.push(indent(s));
         }
 
@@ -1178,12 +1201,33 @@ function emitRecord(rec, line, opts, stylize) {
 }
 
 
+var stdoutFlushed = true;
 function emit(s) {
     try {
-        stdout.write(s);
-    } catch (writeErr) {
-        _selfTrace('exception from stdout.write:', writeErr)
+        stdoutFlushed = stdout.write(s);
+    } catch (e) {
         // Handle any exceptions in stdout writing in `stdout.on('error', ...)`.
+    }
+}
+
+
+/**
+ * A hacked up version of 'process.exit' that will first drain stdout
+ * before exiting. *WARNING: This doesn't stop event processing.* IOW,
+ * callers have to be careful that code following this call isn't
+ * accidentally executed.
+ *
+ * In node v0.6 "process.stdout and process.stderr are blocking when they
+ * refer to regular files or TTY file descriptors." However, this hack might
+ * still be necessary in a shell pipeline.
+ */
+function drainStdoutAndExit(code) {
+    if (_DEBUG) warn('(drainStdoutAndExit(%d))', code);
+    stdout.on('drain', function () {
+        cleanupAndExit(code);
+    });
+    if (stdoutFlushed) {
+        cleanupAndExit(code);
     }
 }
 
@@ -1322,7 +1366,7 @@ function processPids(opts, stylize, callback) {
 
             warn('bunyan: error: level (%d) exceeds maximum logging level',
                 opts.level);
-            cleanupAndExit(1);
+            return drainStdoutAndExit(1);
         }).join(',');
         var argv = ['dtrace', '-Z', '-x', 'strsize=4k',
             '-x', 'switchrate=10hz', '-qn',
@@ -1419,12 +1463,6 @@ function processFile(file, opts, stylize, callback) {
 
     var leftover = '';  // Left-over partial line from last chunk.
     stream.on('data', function (data) {
-        if (exiting) {
-            _selfTrace('stop reading file "%s" because exiting', file);
-            stream.destroy();
-            return;
-        }
-
         var chunk = decoder.write(data);
         if (!chunk.length) {
             return;
@@ -1491,21 +1529,22 @@ function asyncForEach(arr, iterator, callback) {
 /**
  * Cleanup and exit properly.
  *
- * Warning: this doesn't necessarily stop processing, i.e. process exit
- * might be delayed. It is up to the caller to ensure that no subsequent
- * bunyan processing is done after calling this.
+ * Warning: this doesn't stop processing, i.e. process exit might be delayed.
+ * It is up to the caller to ensure that no subsequent bunyan processing
+ * is done after calling this.
  *
  * @param code {Number} exit code.
  * @param signal {String} Optional signal name, if this was exitting because
  *    of a signal.
  */
+var cleanedUp = false;
 function cleanupAndExit(code, signal) {
     // Guard one call.
-    if (exiting) {
+    if (cleanedUp) {
         return;
     }
-    exiting = true;
-    _selfTrace('cleanupAndExit(%s, %s)', code, signal);
+    cleanedUp = true;
+    if (_DEBUG) warn('(bunyan: cleanupAndExit)');
 
     // Clear possibly interrupted ANSI code (issue #59).
     if (usingAnsiCodes) {
@@ -1519,22 +1558,16 @@ function cleanupAndExit(code, signal) {
 
     if (pager) {
         // Let pager know that output is done, then wait for pager to exit.
-        pager.removeListener('exit', onPrematurePagerExit);
-        pager.on('exit', function onPagerExit(pagerCode) {
-            _selfTrace('pager exit -> process.exit(%s)', pagerCode || code);
+        stdout.end();
+        pager.on('exit', function (pagerCode) {
+            if (_DEBUG)
+                warn('(bunyan: pager exit -> process.exit(%s))',
+                    pagerCode || code);
             process.exit(pagerCode || code);
         });
-        stdout.end();
-    } else if (code) {
-        // Non-zero exit: Something is wrong. We are very likely still
-        // processing log records -- i.e. we have open handles -- so we need
-        // a hard stop (aka `process.exit`).
-        _selfTrace('process.exit(%s)', code);
-        process.exit(code);
     } else {
-        // Zero exit: This should be a "normal" exit, for which we want to
-        // flush stdout/stderr.
-        exeunt.softExit(code);
+        if (_DEBUG) warn('(bunyan: process.exit(%s))', code);
+        process.exit(code);
     }
 }
 
@@ -1587,24 +1620,12 @@ process.on('uncaughtException', function (err) {
 });
 
 
-// Early termination of the pager: just stop.
-function onPrematurePagerExit(pagerCode) {
-    _selfTrace('premature pager exit');
-    // 'pager' and 'stdout' are intentionally global.
-    pager = null;
-    stdout.end()
-    stdout = process.stdout;
-    cleanupAndExit(pagerCode);
-}
-
-
 function main(argv) {
     try {
         var opts = parseArgv(argv);
     } catch (e) {
         warn('bunyan: error: %s', e.message);
-        cleanupAndExit(1);
-        return;
+        return drainStdoutAndExit(1);
     }
     if (opts.help) {
         printHelp();
@@ -1617,8 +1638,7 @@ function main(argv) {
     if (opts.pids && opts.args.length > 0) {
         warn('bunyan: error: can\'t use both "-p PID" (%s) and file (%s) args',
             opts.pids, opts.args.join(' '));
-        cleanupAndExit(1);
-        return;
+        return drainStdoutAndExit(1);
     }
     if (opts.color === null) {
         if (process.env.BUNYAN_NO_COLOR &&
@@ -1658,26 +1678,36 @@ function main(argv) {
             // I'll remove 'F' from here.
             env.LESS = 'FRX';
         }
-        _selfTrace('pager: argv=%j, env.LESS=%j', argv, env.LESS);
+        if (_DEBUG) warn('(pager: argv=%j, env.LESS=%j)', argv, env.LESS);
         // `pager` and `stdout` intentionally global.
         pager = spawn(argv[0], argv.slice(1),
             // Share the stderr handle to have error output come
             // straight through. Only supported in v0.8+.
             {env: env, stdio: ['pipe', 1, 2]});
         stdout = pager.stdin;
-        pager.on('exit', onPrematurePagerExit);
+
+        // Early termination of the pager: just stop.
+        pager.on('exit', function (pagerCode) {
+            if (_DEBUG) warn('(bunyan: pager exit)');
+            pager = null;
+            stdout.end()
+            stdout = process.stdout;
+            cleanupAndExit(pagerCode);
+        });
     }
 
     // Stdout error handling. (Couldn't setup until `stdout` was determined.)
     stdout.on('error', function (err) {
-        _selfTrace('stdout error event: %s, exiting=%s', err, exiting);
-        if (exiting) {
-            return;
-        } else if (err.code === 'EPIPE') {
-            cleanupAndExit(0);
+        if (_DEBUG) warn('(stdout error event: %s)', err);
+        if (err.code === 'EPIPE') {
+            drainStdoutAndExit(0);
+        } else if (err.toString() === 'Error: This socket is closed.') {
+            // Could get this if the pager closes its stdin, but hasn't
+            // exited yet.
+            drainStdoutAndExit(1);
         } else {
-            warn('bunyan: error on output stream: %s', err);
-            cleanupAndExit(1);
+            warn(err);
+            drainStdoutAndExit(1);
         }
     });
 
@@ -1704,10 +1734,9 @@ function main(argv) {
             function (err) {
                 if (err) {
                     warn('bunyan: unexpected error: %s', err.stack || err);
-                    cleanupAndExit(1);
-                } else {
-                    cleanupAndExit(retval);
+                    return drainStdoutAndExit(1);
                 }
+                cleanupAndExit(retval);
             }
         );
     } else {
